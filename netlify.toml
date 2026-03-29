@@ -1,0 +1,19 @@
+# netlify.toml
+# Netlify 빌드 및 함수 설정
+
+[build]
+  publish = "."
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+# analyze 함수 타임아웃 26초로 설정 (Netlify 무료 플랜 최대)
+[functions."analyze"]
+  timeout = 26
+
+# 모든 경로를 index.html로 라우팅
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
