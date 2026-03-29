@@ -1,0 +1,15 @@
+# netlify.toml
+# Netlify 빌드 및 함수 설정
+
+[build]
+  publish = "."           # index.html이 루트에 있으므로 현재 디렉토리
+  functions = "netlify/functions"  # 서버리스 함수 위치
+
+[functions]
+  node_bundler = "esbuild"
+
+# 모든 경로를 index.html로 라우팅 (SPA)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
