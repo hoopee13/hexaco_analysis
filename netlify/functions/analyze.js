@@ -1,187 +1,202 @@
 // netlify/functions/analyze.js
-// Anthropic API 키를 서버사이드에서 안전하게 처리하는 프록시 함수
+// HEXACO 성격 분석 — Claude API 프록시 함수
+// 8점 만점 기준 (1.0 ~ 8.0)
 
+const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
+const MODEL = 'claude-sonnet-4-5'; // 성능·비용 균형. 더 깊은 해석이 필요하면 'claude-opus-4-7'
+
+// ── 차원 메타데이터 ─────────────────────────────────
+const DIM_INFO = {
+  H: { ko: '정직·겸손',  en: 'Honesty-Humility' },
+  E: { ko: '정서성',      en: 'Emotionality' },
+  X: { ko: '외향성',      en: 'Extraversion' },
+  A: { ko: '원만성',      en: 'Agreeableness' },
+  C: { ko: '성실성',      en: 'Conscientiousness' },
+  O: { ko: '개방성',      en: 'Openness' },
+};
+
+// ── 8점 만점 해석 구간 ─────────────────────────────
+function levelOf(s) {
+  if (s >= 6.8) return '매우 높음';
+  if (s >= 5.6) return '높음';
+  if (s >= 4.3) return '중간';
+  if (s >= 2.9) return '낮음';
+  return '매우 낮음';
+}
+
+// ── 프롬프트 빌더 ───────────────────────────────────
+function buildPrompt(sc) {
+  // 점수 정렬: 높은 순
+  const sorted = Object.entries(sc).sort((a, b) => b[1] - a[1]);
+  const avg = Object.values(sc).reduce((a, b) => a + b, 0) / 6;
+  const spread = sorted[0][1] - sorted[sorted.length - 1][1];
+
+  const scoreLines = sorted
+    .map(([k, v]) => `  - ${DIM_INFO[k].ko} (${k}): ${v.toFixed(1)}점 — ${levelOf(v)}`)
+    .join('\n');
+
+  return `당신은 HEXACO 성격 모델 전문가입니다. 한 사람의 6가지 성격 차원 점수를 바탕으로, 20-30대 한국인 맥락에 맞는 깊이 있고 따뜻한 해석을 작성해주세요.
+
+## 점수 해석 기준 (8점 만점)
+- 6.8점 이상: 매우 높음
+- 5.6 ~ 6.8점: 높음
+- 4.3 ~ 5.6점: 중간
+- 2.9 ~ 4.3점: 낮음
+- 2.9점 미만: 매우 낮음
+
+고/저 구분선:
+- 높음(h): 5.7점 이상
+- 중간(m): 3.5 ~ 5.7점
+- 낮음(l): 3.5점 미만
+
+중간값(평균적인 사람)은 4.5점입니다.
+
+## 분석 대상자의 점수
+${scoreLines}
+
+전체 평균: ${avg.toFixed(2)}점
+차원 간 격차(최고-최저): ${spread.toFixed(1)}점
+
+## 작성 지침
+1. **4~5개 단락, 각 단락은 3~5줄** 정도의 길이로 작성하세요.
+2. **가장 두드러지는 1~2개 차원을 중심**으로 해석하되, 나머지 차원과의 상호작용도 언급하세요.
+3. **일상적인 상황 예시** (직장, 연인, 친구, 가족, 자기관리 등)를 구체적으로 들어 서술하세요.
+4. **"당신은 ~한 사람입니다"** 형식으로 2인칭 존댓말을 사용하세요.
+5. 차원 이름을 언급할 때는 **한국어 이름 + (점수)** 형식으로 표기하세요. 예: **정직·겸손(6.2점)**
+6. **강점과 긴장(주의할 점)을 함께** 다뤄주세요. 장점만 나열하지 마세요.
+7. 차원 간 격차가 크다면(4.4점 이상), 그 **극단성 자체가 의미 있는 패턴**임을 짚어주세요.
+8. 평균이 높으면(5.9점 이상) **번아웃 위험**을, 낮으면(3.3점 미만) **회복의 필요성**을 언급하세요.
+9. 마크다운 **굵게(**텍스트**)** 는 사용 가능, 헤더(#)와 목록(-)은 사용하지 마세요.
+10. 전체 글은 **자연스러운 프로즈(paragraph)** 형태로, 심리상담가가 편지 쓰듯 작성하세요.
+
+이제 이 사람만의 고유한 해석을 작성해주세요.`;
+}
+
+// ── Netlify Function 핸들러 ────────────────────────
 exports.handler = async (event) => {
-  // CORS 헤더
-  const headers = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  };
-
-  // Preflight 요청 처리
+  // CORS 프리플라이트
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers, body: '' };
+    return {
+      statusCode: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      },
+      body: '',
+    };
   }
 
   if (event.httpMethod !== 'POST') {
     return {
       statusCode: 405,
-      headers,
-      body: JSON.stringify({ error: 'Method not allowed' }),
+      body: JSON.stringify({ error: 'POST 메서드만 지원합니다.' }),
     };
   }
 
-  // Netlify 환경변수에서 API 키 읽기 (절대 클라이언트에 노출되지 않음)
+  // API 키 확인
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     return {
       statusCode: 500,
-      headers,
-      body: JSON.stringify({ error: 'API key not configured' }),
+      body: JSON.stringify({
+        error: 'ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다. Netlify 대시보드 → Site configuration → Environment variables에서 설정해주세요.',
+      }),
     };
   }
 
-  let body;
+  // 요청 파싱
+  let sc;
   try {
-    body = JSON.parse(event.body);
+    const body = JSON.parse(event.body || '{}');
+    sc = body.sc;
   } catch {
     return {
       statusCode: 400,
-      headers,
-      body: JSON.stringify({ error: 'Invalid JSON' }),
+      body: JSON.stringify({ error: '요청 본문이 올바른 JSON이 아닙니다.' }),
     };
   }
 
-  const { sc } = body; // { H, E, X, A, C, O }
-  if (!sc) {
+  // 입력 검증 — 6개 차원 모두 존재하고 1~8 범위인지
+  const required = ['H', 'E', 'X', 'A', 'C', 'O'];
+  if (!sc || typeof sc !== 'object') {
     return {
       statusCode: 400,
-      headers,
-      body: JSON.stringify({ error: 'Missing score data' }),
+      body: JSON.stringify({ error: '점수 객체(sc)가 누락되었습니다.' }),
     };
   }
-
-  // 점수 데이터 가공
-  const KO = { H:'정직·겸손', E:'정서성', X:'외향성', A:'원만성', C:'성실성', O:'개방성' };
-  const EN = { H:'Honesty-Humility', E:'Emotionality', X:'eXtraversion', A:'Agreeableness', C:'Conscientiousness', O:'Openness' };
-  const DIMS = ['H','E','X','A','C','O'];
-
-  function lvl(s) {
-    if (s >= 4.3) return '매우 높음';
-    if (s >= 3.6) return '높음';
-    if (s >= 2.9) return '중간';
-    if (s >= 2.1) return '낮음';
-    return '매우 낮음';
+  for (const k of required) {
+    const v = sc[k];
+    if (typeof v !== 'number' || isNaN(v) || v < 1 || v > 8) {
+      return {
+        statusCode: 400,
+        body: JSON.stringify({
+          error: `차원 ${k}의 점수가 유효하지 않습니다. 1.0~8.0 범위의 숫자여야 합니다. (받은 값: ${v})`,
+        }),
+      };
+    }
   }
 
-  const sorted = Object.entries(sc).sort((a, b) => b[1] - a[1]);
-  const avg    = Object.values(sc).reduce((a, b) => a + b, 0) / 6;
-  const top    = sorted[0][0];
-  const second = sorted[1][0];
-  const third  = sorted[2][0];
-  const bot    = sorted[sorted.length - 1][0];
-  const bot2   = sorted[sorted.length - 2][0];
-  const spread = (sorted[0][1] - sorted[sorted.length - 1][1]).toFixed(1);
-
-  // 상위/하위 조합 설명
-  const topCombos = sorted.slice(0,3).map(e=>`${KO[e[0]]}(${e[1].toFixed(1)}점)`).join(', ');
-  const botCombos = sorted.slice(-2).map(e=>`${KO[e[0]]}(${e[1].toFixed(1)}점)`).join(', ');
-
-  const dimDesc = DIMS.map(d =>
-    `  - ${KO[d]}(${EN[d]}): ${sc[d].toFixed(1)}점 [${lvl(sc[d])}]`
-  ).join('\n');
-
-  const prompt = `당신은 HEXACO 성격 모델을 깊이 연구한 심리학 전문가입니다.
-아래 점수를 바탕으로 이 사람만의 고유한 성격 프로파일을 다각적으로 분석해주세요.
-
-━━━ HEXACO 점수 ━━━
-${dimDesc}
-
-전체 평균: ${avg.toFixed(2)}점 / 5.0
-상위 차원: ${topCombos}
-하위 차원: ${botCombos}
-차원 간 최대 격차: ${spread}점
-
-━━━ 분석 요청 ━━━
-
-아래 7개 관점을 모두 포함하여 총 20줄 내외의 풍부한 프로파일을 작성해주세요.
-각 단락은 자연스럽게 이어지는 하나의 이야기처럼 구성해주세요.
-
-【1. 핵심 성격 구조】
-가장 높은 두 차원(${KO[top]}, ${KO[second]})이 만들어내는 이 사람의 본질적인 성격 구조를 설명하세요.
-단순 특성 나열이 아니라, 이 두 가지가 어떻게 결합되어 고유한 패턴을 만드는지 서술하세요.
-
-【2. 강점이 발휘되는 구체적 상황】
-직장, 연애, 친구 관계에서 이 조합의 강점이 실제로 어떻게 나타나는지 생생한 상황으로 설명하세요.
-20-30대가 "맞아, 나 이랬어"라고 공감할 수 있는 구체적인 장면을 포함하세요.
-
-【3. 높은 차원과 낮은 차원의 상호작용】
-${KO[top]}이 높고 ${KO[bot]}이 낮은 이 조합이 만들어내는 내면의 긴장 또는 시너지를 분석하세요.
-예를 들어, 강한 특성이 약한 특성을 어떻게 보완하거나 충돌하는지 구체적으로 서술하세요.
-
-【4. 반복되는 패턴과 숨은 함정】
-이 성격 구조를 가진 사람이 직장, 관계, 자기관리에서 반복적으로 경험하는 어려움이나 함정을 솔직하게 서술하세요.
-"나만 이런 게 아니었구나"라고 느낄 수 있도록 공감적으로 써주세요.
-
-【5. 에너지 수준과 번아웃/회복 패턴】
-전체 평균 ${avg.toFixed(2)}점을 고려해서, 이 사람이 에너지를 어떻게 쓰고 회복하는지 분석하세요.
-어떤 상황에서 충전되고, 어떤 상황에서 소진되는지 구체적으로 서술하세요.
-
-【6. 성장을 위한 실질적 방향】
-이 성격 구조가 더 건강하게 발전하려면 어떤 방향이 필요한지 구체적으로 제안하세요.
-막연한 조언이 아니라 실제로 시도해볼 수 있는 행동 방향으로 써주세요.
-
-【7. 따뜻한 마무리】
-20-30대라는 이 시기에 이 성격을 갖고 살아가는 것의 의미를 따뜻하게 마무리해주세요.
-점수가 높든 낮든, 이 성격은 그 자체로 의미 있다는 메시지로 끝맺어주세요.
-
-━━━ 작성 규칙 ━━━
-- 한국어로 작성, 20-30대 공감 언어 사용
-- 총 7단락, 각 단락 2-4문장, 전체 20줄 내외
-- **굵게**로 핵심 키워드 3-5개 강조
-- 심리학 용어보다 일상 언어 우선
-- "당신은" 2인칭으로 직접 말 걸기
-- 점수의 높고 낮음은 우열이 아닌 방향의 차이임을 전제로`;
-
-
+  // Claude API 호출
   try {
-    // fetch 자체에 타임아웃 설정 (24초 — Netlify 26초 제한보다 여유있게)
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 24000);
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const apiRes = await fetch(ANTHROPIC_API_URL, {
       method: 'POST',
-      signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001', // Haiku: Sonnet보다 3~5배 빠름
-        max_tokens: 1500,
-        messages: [{ role: 'user', content: prompt }],
+        model: MODEL,
+        max_tokens: 2000,
+        messages: [
+          { role: 'user', content: buildPrompt(sc) },
+        ],
       }),
     });
 
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error('Anthropic API error:', errText);
+    if (!apiRes.ok) {
+      const errText = await apiRes.text();
+      console.error('Claude API error:', apiRes.status, errText);
       return {
-        statusCode: response.status,
-        headers,
-        body: JSON.stringify({ error: 'Anthropic API error', detail: errText }),
+        statusCode: apiRes.status,
+        body: JSON.stringify({
+          error: `Claude API 오류 (${apiRes.status}): ${errText.slice(0, 200)}`,
+        }),
       };
     }
 
-    const data = await response.json();
-    const text = data.content?.[0]?.text || '';
+    const data = await apiRes.json();
+
+    // 응답에서 텍스트 추출
+    const text = (data.content || [])
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n')
+      .trim();
+
+    if (!text) {
+      return {
+        statusCode: 500,
+        body: JSON.stringify({ error: 'Claude API 응답에서 텍스트를 찾을 수 없습니다.' }),
+      };
+    }
 
     return {
       statusCode: 200,
-      headers: { ...headers, 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      },
       body: JSON.stringify({ text }),
     };
-
   } catch (err) {
     console.error('Function error:', err);
     return {
       statusCode: 500,
-      headers,
-      body: JSON.stringify({ error: err.message }),
+      body: JSON.stringify({
+        error: `서버 내부 오류: ${err.message || '알 수 없는 오류'}`,
+      }),
     };
   }
 };
